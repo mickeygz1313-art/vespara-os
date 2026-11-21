@@ -1,0 +1,90 @@
+name: Build Vespara OS ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Also publish the ISO as a GitHub Release (easiest download)"
+        type: boolean
+        default: true
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # needed to create a Release
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the project
+        id: p
+        run: |
+          if [ -f build-iso.sh ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          elif [ -f vespara-os.tar.gz ]; then
+            tar xzf vespara-os.tar.gz
+            echo "dir=vespara" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Put vespara-os.tar.gz (or the extracted project files) in the root of this repository."
+            exit 1
+          fi
+
+      - name: Free up disk space (the build needs ~15 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Build the ISO inside an Arch Linux container
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD/${{ steps.p.outputs.dir }}":/work -w /work \
+            archlinux:latest bash ci/build-in-container.sh
+
+      - name: Checksums, and split if over GitHub's 2 GiB-per-file release limit
+        id: pack
+        run: |
+          OUT="$GITHUB_WORKSPACE/${{ steps.p.outputs.dir }}/out"
+          REL="$GITHUB_WORKSPACE/release"
+          mkdir -p "$REL"
+          ISO=$(ls -t "$OUT"/vespara-*.iso | head -1)
+          NAME=$(basename "$ISO")
+          ( cd "$OUT" && sha256sum "$NAME" > "$NAME.sha256" )
+          cp "$OUT/$NAME.sha256" "$REL/"
+          SIZE=$(stat -c%s "$ISO")
+          echo "ISO: $NAME  ($((SIZE/1024/1024)) MiB)"
+          if [ "$SIZE" -gt $((1900*1024*1024)) ]; then
+            split -b 1900M -d -a 2 "$ISO" "$REL/$NAME.part"
+            printf 'Join the parts into one ISO:\n  Linux/macOS:  cat %s.part* > %s\n  Windows (cmd): copy /b %s.part00 + %s.part01 %s\nThen check it against %s.sha256\n' \
+              "$NAME" "$NAME" "$NAME" "$NAME" "$NAME" "$NAME" > "$REL/HOW-TO-JOIN.txt"
+          else
+            cp "$ISO" "$REL/"
+          fi
+          ls -lh "$REL"
+
+      - name: Keep the full ISO as a build artifact (7 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vespara-os-iso
+          path: |
+            ${{ steps.p.outputs.dir }}/out/*.iso
+            ${{ steps.p.outputs.dir }}/out/*.sha256
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Publish a GitHub Release
+        if: github.event_name == 'push' || inputs.publish_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('iso-{0}', github.run_number) }}
+          name: Vespara OS ISO (build ${{ github.run_number }})
+          body: |
+            Bootable Vespara OS live + installer ISO.
+            Write it to a USB stick with Rufus (DD mode), balenaEtcher or Ventoy, or boot it in a VM.
+            If it came in several `.part` files, see HOW-TO-JOIN.txt.
+          files: release/*
